@@ -44,19 +44,20 @@ _ARTIFACT_EXTENSIONS = _IMAGE_EXTENSIONS | _DOWNLOAD_EXTENSIONS
 # when large — this is only a "don't accidentally ship a DVD ISO" guard.
 _MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MiB
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    StreamEvent,
-    SystemMessage,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-    create_sdk_mcp_server,
-    tool,
-)
+ from claude_agent_sdk import (
+     AssistantMessage,
+     ClaudeAgentOptions,
+     ClaudeSDKClient,
+     RateLimitEvent,
+     ResultMessage,
+     StreamEvent,
+     SystemMessage,
+     ToolResultBlock,
+     ToolUseBlock,
+     UserMessage,
+     create_sdk_mcp_server,
+     tool,
+ )
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,26 @@ _TOOL_PREVIEW_FIELDS = {
     "WebFetch": "url",
     "Task": "description",
 }
+
+def _format_rate_limit(info) -> str:
+    """Human-readable line for a RateLimitEvent.rate_limit_info."""
+    import datetime
+
+    parts = []
+    if info.status == "rejected":
+        parts.append("🛑 API-Limit erreicht")
+    elif info.status == "allowed_warning":
+        parts.append("⚠️ API-Limit fast erreicht")
+    else:
+        parts.append(f"ℹ️ Rate-Limit-Status: {info.status}")
+    if info.rate_limit_type:
+        parts.append(f"({info.rate_limit_type})")
+    if info.utilization is not None:
+        parts.append(f"· {info.utilization * 100:.0f}% genutzt")
+    if info.resets_at:
+        reset_str = datetime.datetime.fromtimestamp(info.resets_at).strftime("%H:%M:%S")
+        parts.append(f"· verfügbar wieder ab {reset_str}")
+    return " ".join(parts)
 
 
 def _tool_preview(name: str, tool_input: Dict[str, Any]) -> str:
@@ -1696,6 +1717,15 @@ class Pipe:
                                     )
                         continue
 
+                    if isinstance(message, RateLimitEvent):
+                        info = message.rate_limit_info
+                        line = _format_rate_limit(info)
+                        await emit_status(line, done=(info.status == "rejected"))
+                        if info.status in ("allowed_warning", "rejected"):
+                            yield f"\n\n_{line}_\n"
+                        continue
+ 
+                                         
                     if isinstance(message, ResultMessage):
                         await emit_status("Done.", done=True)
                         for chunk in _inline_new_artifacts(
@@ -1706,6 +1736,8 @@ class Pipe:
                             yield chunk
                         if message.subtype != "success":
                             yield f"\n\n_Agent stopped: {message.subtype}_\n"
+                        if message.api_error_status:
+                            yield f"\n\n**API-Fehler:** `{message.api_error_status}`\n"
                         if message.total_cost_usd is not None:
                             yield f"\n\n_Cost: ${message.total_cost_usd:.4f} · {message.duration_ms}ms_\n"
                         return
