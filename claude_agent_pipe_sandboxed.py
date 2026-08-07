@@ -4,7 +4,8 @@ description: Run Claude Code inside an open-webui/open-terminal sandbox, one
   Linux account per OpenWebUI user. Isolates the agent's file/process reach
   from the Open WebUI backend host.
 author: Thomas Friedel
-version: 0.1
+contributors: Speedliner
+version: 0.2
 license: MIT
 requirements: httpx>=0.27
 """
