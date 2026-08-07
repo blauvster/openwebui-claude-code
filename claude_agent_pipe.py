@@ -3,7 +3,7 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 contributors: Speedliner
-version: 0.2
+version: 0.3
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
