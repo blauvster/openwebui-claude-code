@@ -994,10 +994,40 @@ async def _handle_event(
                 )
         return
 
+    if etype == "rate_limit_event":
+        info = event.get("rate_limit_info") or {}
+        status = info.get("status")
+        line_parts = []
+        if status == "rejected":
+            line_parts.append("🛑 API-Limit erreicht")
+        elif status == "allowed_warning":
+            line_parts.append("⚠️ API-Limit fast erreicht")
+        else:
+            line_parts.append(f"ℹ️ Rate-Limit-Status: {status}")
+        rl_type = info.get("rateLimitType")
+        if rl_type:
+            line_parts.append(f"({rl_type})")
+        utilization = info.get("utilization")
+        if utilization is not None:
+            line_parts.append(f"· {utilization * 100:.0f}% genutzt")
+        resets_at = info.get("resetsAt")
+        if resets_at:
+            import datetime
+            reset_str = datetime.datetime.fromtimestamp(resets_at).strftime("%H:%M:%S")
+            line_parts.append(f"· verfügbar wieder ab {reset_str}")
+        line = " ".join(line_parts)
+        await emit_status(line, done=(status == "rejected"))
+        if status in ("allowed_warning", "rejected"):
+            yield f"\n\n_{line}_\n"
+        return
+  
     if etype == "result":
         subtype = event.get("subtype")
         if subtype and subtype != "success":
             yield f"\n\n_Agent stopped: {subtype}_\n"
+        api_error_status = event.get("api_error_status")
+        if api_error_status:
+            yield f"\n\n**API-Fehler:** `{api_error_status}`\n"
         cost = event.get("total_cost_usd")
         dur = event.get("duration_ms")
         if cost is not None and dur is not None:
