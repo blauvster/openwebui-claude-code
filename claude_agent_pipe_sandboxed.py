@@ -1021,7 +1021,7 @@ async def _handle_event(
         if status in ("allowed_warning", "rejected"):
             yield f"\n\n_{line}_\n"
         return
-  
+
     if etype == "result":
         subtype = event.get("subtype")
         if subtype and subtype != "success":
