@@ -44,20 +44,20 @@ _ARTIFACT_EXTENSIONS = _IMAGE_EXTENSIONS | _DOWNLOAD_EXTENSIONS
 # when large — this is only a "don't accidentally ship a DVD ISO" guard.
 _MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MiB
 
- from claude_agent_sdk import (
-     AssistantMessage,
-     ClaudeAgentOptions,
-     ClaudeSDKClient,
-     RateLimitEvent,
-     ResultMessage,
-     StreamEvent,
-     SystemMessage,
-     ToolResultBlock,
-     ToolUseBlock,
-     UserMessage,
-     create_sdk_mcp_server,
-     tool,
- )
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    RateLimitEvent,
+    ResultMessage,
+    StreamEvent,
+    SystemMessage,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+    create_sdk_mcp_server,
+    tool,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1724,8 +1724,7 @@ class Pipe:
                         if info.status in ("allowed_warning", "rejected"):
                             yield f"\n\n_{line}_\n"
                         continue
- 
-                                         
+
                     if isinstance(message, ResultMessage):
                         await emit_status("Done.", done=True)
                         for chunk in _inline_new_artifacts(
