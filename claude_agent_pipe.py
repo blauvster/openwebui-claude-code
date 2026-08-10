@@ -21,6 +21,9 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
+from session_store import get_store
+from session_marker import extract_session_id_from_messages, make_marker
+
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
 _DOWNLOAD_EXTENSIONS = {
     ".pdf",
@@ -61,8 +64,15 @@ from claude_agent_sdk import (
 
 log = logging.getLogger(__name__)
 
-# OpenWebUI calls pipe() fresh for each chat turn. We keep a chat_id -> session_id
-# map in-process so follow-up turns resume the same Claude Code session.
+# OpenWebUI calls pipe() fresh for each chat turn. This in-process dict is a
+# fast path so a hot worker doesn't have to hit SQLite on every turn. It is
+# NOT the source of truth anymore: it starts empty on every process restart
+# and is per-worker (stale/absent on any other worker), which is exactly why
+# Claude Code used to "forget" chat history across restarts / multi-worker
+# deployments. The source of truth is session_store.SessionStore (SQLite,
+# survives restarts, shared across workers via the shared filesystem), with
+# session_marker as a secondary fallback embedded in the chat text itself.
+# See session_store.py / session_marker.py for the full rationale.
 _chat_sessions: Dict[str, str] = {}
 
 
@@ -1495,13 +1505,49 @@ class Pipe:
         prompt = _strip_mode_prefix(prompt)
 
         chat_id = __chat_id__ or "default"
+        if not __chat_id__:
+            log.warning(
+                "pipe() called without __chat_id__ — falling back to a shared "
+                "'default' workdir/session. Session resume across turns will "
+                "not work correctly for this call (see OpenWebUI issue about "
+                "metadata.chat_id being unset for certain internal calls)."
+            )
         workdir = Path(self.valves.WORKDIR_ROOT) / chat_id
         workdir.mkdir(parents=True, exist_ok=True)
 
         allowed_tools = [
             t.strip() for t in self.valves.ALLOWED_TOOLS.split(",") if t.strip()
         ]
+
+        # Resolve the session to resume, in order of preference:
+        #   1. In-process cache (_chat_sessions) — fastest, but empty after a
+        #      restart or on any worker that didn't handle the previous turn.
+        #   2. SQLite-backed SessionStore — survives restarts and is shared
+        #      across worker processes via the shared filesystem under
+        #      WORKDIR_ROOT. This is the source of truth.
+        #   3. Marker embedded in the previous assistant message, extracted
+        #      from OpenWebUI's own chat history in `body`. Fallback only,
+        #      for the case where the SQLite file itself became unavailable
+        #      (e.g. WORKDIR_ROOT lives on ephemeral storage that was wiped
+        #      independently of OpenWebUI's own chat database).
+        session_store = get_store(self.valves.WORKDIR_ROOT)
         resume_id = _chat_sessions.get(chat_id)
+        resume_source = "memory" if resume_id else None
+        if not resume_id:
+            resume_id = session_store.get(chat_id)
+            if resume_id:
+                resume_source = "sqlite"
+        if not resume_id:
+            resume_id = extract_session_id_from_messages(body.get("messages") or [])
+            if resume_id:
+                resume_source = "marker"
+        if resume_id:
+            log.debug(
+                "Resuming Claude Code session %s for chat_id=%s (source=%s)",
+                resume_id,
+                chat_id,
+                resume_source,
+            )
 
         # Knowledge base attached via Workspace Model → expose as an MCP tool
         # Claude can call agentically. OpenWebUI's middleware already added one
@@ -1621,6 +1667,11 @@ class Pipe:
                             session_id = message.data.get("session_id")
                             if session_id:
                                 _chat_sessions[chat_id] = session_id
+                                # Persist beyond this process's lifetime/worker.
+                                # Cheap (single upsert) and done on every init
+                                # message, i.e. once per turn — not hot-path
+                                # sensitive.
+                                session_store.set(chat_id, session_id)
                         continue
 
                     if isinstance(message, StreamEvent):
@@ -1739,6 +1790,16 @@ class Pipe:
                             yield f"\n\n**API-Fehler:** `{message.api_error_status}`\n"
                         if message.total_cost_usd is not None:
                             yield f"\n\n_Cost: ${message.total_cost_usd:.4f} · {message.duration_ms}ms_\n"
+                        # Fallback-path marker (see session_marker.py): embed
+                        # the session_id invisibly in the reply itself so it
+                        # can be recovered from OpenWebUI's own chat history
+                        # even if both the in-memory cache and the SQLite
+                        # store are unavailable on a later turn. This does
+                        # NOT write into any OpenWebUI-owned data — it's part
+                        # of the ordinary streamed assistant text.
+                        current_session_id = _chat_sessions.get(chat_id)
+                        if current_session_id:
+                            yield make_marker(current_session_id)
                         return
 
         except Exception as exc:
