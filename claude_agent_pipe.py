@@ -21,8 +21,165 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
-from session_store import get_store
-from session_marker import extract_session_id_from_messages, make_marker
+# ---------------------------------------------------------------------------
+# Inlined from session_store.py / session_marker.py.
+#
+# OpenWebUI Functions are loaded as a single in-memory module via exec() (see
+# open_webui/utils/plugin.py: load_function_module_by_id) — there is no
+# mechanism to ship additional .py files alongside a Function, so importing
+# sibling modules (`from session_store import ...`) fails with
+# ModuleNotFoundError at install time. Both modules are therefore inlined
+# here verbatim. Keep the original files in the repo in sync if you edit
+# this logic — they are the canonical, independently testable source; this
+# inlined copy is what actually ships to OpenWebUI.
+# ---------------------------------------------------------------------------
+
+import sqlite3
+import threading
+
+_SESSION_STORE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS claude_code_sessions (
+    chat_id     TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+"""
+
+
+class SessionStore:
+    """Thread-safe, file-backed chat_id -> session_id store.
+
+    Persists the chat_id -> Claude Code session_id mapping in a small SQLite
+    database next to the per-chat workdir (WORKDIR_ROOT/.session_store.sqlite3).
+    This replaces a plain in-process dict, which loses all mappings on every
+    backend restart and is inconsistent across multiple worker processes.
+
+    Deliberately NOT integrated with OpenWebUI's own database: OpenWebUI's
+    internal SQLAlchemy engine/schema is not a stable, documented plugin API,
+    and writing into OpenWebUI's own chat/message tables risks racing with
+    OpenWebUI's own read-modify-write cycle on those rows. A separate SQLite
+    file has no such overlap and needs no coordination with OpenWebUI.
+    """
+
+    def __init__(self, root_dir, filename: str = ".session_store.sqlite3") -> None:
+        self._path = Path(root_dir) / filename
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=10)
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA busy_timeout=5000;")
+        with self._lock:
+            self._conn.execute(_SESSION_STORE_SCHEMA)
+            self._conn.commit()
+
+    def get(self, chat_id: str) -> Optional[str]:
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT session_id FROM claude_code_sessions WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                row = cur.fetchone()
+            return row[0] if row else None
+        except sqlite3.Error:
+            log.exception("SessionStore.get failed for chat_id=%s", chat_id)
+            return None
+
+    def set(self, chat_id: str, session_id: str) -> None:
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO claude_code_sessions (chat_id, session_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        session_id = excluded.session_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (chat_id, session_id, time.time()),
+                )
+                self._conn.commit()
+        except sqlite3.Error:
+            log.exception("SessionStore.set failed for chat_id=%s", chat_id)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+_session_stores: Dict[str, "SessionStore"] = {}
+_session_stores_lock = threading.Lock()
+
+
+def get_store(root_dir) -> "SessionStore":
+    """Return a process-wide singleton SessionStore per WORKDIR_ROOT."""
+    key = str(root_dir)
+    with _session_stores_lock:
+        store = _session_stores.get(key)
+        if store is None:
+            store = SessionStore(root_dir)
+            _session_stores[key] = store
+        return store
+
+
+_SESSION_MARKER_RE = re.compile(r"\[claude-session:([A-Za-z0-9_-]{1,128})\]:\s*#")
+
+
+def make_marker(session_id: str) -> str:
+    """Invisible in-text marker carrying the session_id, appended to replies.
+
+    Fallback for when the SQLite store is unreachable/wiped independently of
+    OpenWebUI's own chat history (e.g. different volume lifecycle across a
+    container redeploy). This is a Markdown link reference definition
+    (`[label]: #`), which CommonMark-compliant renderers register but never
+    render as visible output. Rides inside the ordinary assistant message
+    text that OpenWebUI already persists — no extra write path into
+    OpenWebUI's own data model, hence no extra race-condition surface.
+    """
+    return f"\n\n[claude-session:{session_id}]: #\n"
+
+
+def extract_session_id_from_messages(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Scan chat history (most recent first) for the last embedded marker.
+
+    Only works if OpenWebUI resends prior assistant messages in
+    body["messages"] (the normal case for Chat-Completions-shaped pipes).
+    Fallback only, not a replacement for the SQLite store.
+    """
+    for message in reversed(messages or []):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        text = _flatten_marker_content(content)
+        if not text:
+            continue
+        match = _SESSION_MARKER_RE.search(text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def strip_marker(text: str) -> str:
+    """Remove marker lines from text before showing/logging it elsewhere."""
+    return _SESSION_MARKER_RE.sub("", text)
+
+
+def _flatten_marker_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# End of inlined session_store.py / session_marker.py
+# ---------------------------------------------------------------------------
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
 _DOWNLOAD_EXTENSIONS = {
