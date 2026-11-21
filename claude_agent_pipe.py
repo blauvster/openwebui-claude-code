@@ -5,8 +5,12 @@ author: Thomas Friedel
 contributors: Speedliner
 version: 0.3
 license: MIT
-requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
+
+# NOTE (local): the frontmatter `requirements:` line was intentionally removed.
+# This deployment is a `uv tool` install of OpenWebUI (isolated env, no pip),
+# so OpenWebUI's frontmatter pip install fails. Deps are installed via uv by
+# the bootstrap below instead. See LOCAL_CHANGES.md.
 
 import asyncio
 import json
@@ -20,6 +24,53 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
+
+# >>> local edit: uv dependency bootstrap ---------------------------------
+# OpenWebUI here is a `uv tool` install (isolated env, no pip), so the
+# frontmatter `requirements:` pip path can't run — that line is intentionally
+# removed above. Instead we install runtime deps into THIS interpreter's env
+# via uv, on first import. Self-heals across `uv tool upgrade open-webui`
+# (which wipes extra packages): the next load just reinstalls them.
+import importlib.util
+import shutil
+import subprocess
+import sys
+
+
+def _ensure_deps() -> None:
+    required = {
+        "claude_agent_sdk": "claude-agent-sdk>=0.1.60",
+        "anthropic": "anthropic>=0.40.0",
+    }
+    missing = [
+        spec for mod, spec in required.items() if importlib.util.find_spec(mod) is None
+    ]
+    if not missing:
+        return
+    # systemd service PATH usually lacks ~/.local/bin, so find uv explicitly.
+    uv = shutil.which("uv") or next(
+        (
+            p
+            for p in (
+                os.path.expanduser("~/.local/bin/uv"),
+                "/root/.local/bin/uv",
+                "/usr/local/bin/uv",
+            )
+            if os.path.exists(p)
+        ),
+        None,
+    )
+    if uv:
+        cmd = [uv, "pip", "install", "--python", sys.executable, *missing]
+    else:
+        # Last resort if the uv binary isn't found.
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
+        cmd = [sys.executable, "-m", "pip", "install", *missing]
+    subprocess.check_call(cmd)
+
+
+_ensure_deps()
+# <<< local edit ----------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Inlined from session_store.py / session_marker.py.
@@ -65,7 +116,9 @@ class SessionStore:
         self._path = Path(root_dir) / filename
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=10)
+        self._conn = sqlite3.connect(
+            str(self._path), check_same_thread=False, timeout=10
+        )
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA busy_timeout=5000;")
         with self._lock:
@@ -244,6 +297,7 @@ _TOOL_PREVIEW_FIELDS = {
     "WebFetch": "url",
     "Task": "description",
 }
+
 
 def _format_rate_limit(info) -> str:
     """Human-readable line for a RateLimitEvent.rate_limit_info."""
@@ -1201,6 +1255,83 @@ def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Multi-session routing
+#
+# Claude Code derives its auto-memory location from the session cwd:
+#   ~/.claude/projects/<cwd with "/" and "." replaced by "-">/memory/
+# So giving each (service[, user]) route its own cwd gives it its own isolated
+# memory with no extra machinery. The route key is also the workdir name.
+# ---------------------------------------------------------------------------
+_SLUG_RE = re.compile(r"[^a-z0-9._-]+")
+
+
+def _slug(value: str) -> str:
+    """Filesystem-safe lowercase slug (no path separators, no leading dots)."""
+    out = _SLUG_RE.sub("-", str(value).strip().lower()).strip("-.")
+    return out[:80]
+
+
+def _parse_routing_services(raw: str) -> Dict[str, bool]:
+    """'home-assistant,nextcloud:user' -> {'home-assistant': False, 'nextcloud': True}.
+    Value is True when the service is per-user."""
+    services: Dict[str, bool] = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, mode = part.partition(":")
+        name = _slug(name)
+        if name:
+            services[name] = mode.strip().lower() == "user"
+    return services
+
+
+def resolve_route(
+    services: Dict[str, bool],
+    body: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]],
+    user_dict: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Return a route key like 'home-assistant' or 'nextcloud-alice-example.com',
+    or None to use the legacy per-chat workspace.
+
+    Service is taken from, in order:
+      1. an explicit route object: body["route"] or metadata["route"]
+         ({"service": "nextcloud", "user": "alice@example.com"})
+      2. the model id suffix, e.g. model "claude-code-nextcloud"
+    The user for per-user services is route["user"], else the authenticated
+    OpenWebUI user's email, else their id.
+    Unknown services (not in `services`) are rejected -> None.
+    """
+    if not services:
+        return None
+    route = body.get("route") or (metadata or {}).get("route") or {}
+    if not isinstance(route, dict):
+        route = {}
+    service = _slug(route.get("service") or "")
+    if not service:
+        model_id = str(body.get("model") or "")
+        for name in sorted(services, key=len, reverse=True):
+            if model_id.endswith("-" + name) or model_id.endswith("." + name):
+                service = name
+                break
+    if service not in services:
+        return None
+    if not services[service]:
+        return service
+    user = _slug(
+        route.get("user")
+        or (user_dict or {}).get("email")
+        or (user_dict or {}).get("id")
+        or ""
+    )
+    if not user:
+        log.warning("Per-user service %r called without a user; using legacy routing", service)
+        return None
+    return f"{service}-{user}"
+
+
 class Pipe:
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(
@@ -1234,6 +1365,16 @@ class Pipe:
             default="/tmp/claude-agent-pipe",
             description="Root directory for per-chat workspaces. One subdir per chat_id.",
         )
+        ROUTING_SERVICES: str = Field(
+            default="",
+            description=(
+                "Enables multi-session routing. Comma-separated services; "
+                "suffix ':user' makes a service per-user. Example: "
+                "'home-assistant,nextcloud:user'. Each route gets its own "
+                "workdir (WORKDIR_ROOT/<route>) and therefore its own Claude "
+                "Code memory. Empty = disabled (one workspace per chat)."
+            ),
+        )
         MAX_TURNS: int = Field(
             default=30,
             description="Maximum agent turns per user message. 0 disables the cap.",
@@ -1252,12 +1393,52 @@ class Pipe:
                 "trust and control. Avoid on multi-user/public deployments."
             ),
         )
+        # >>> local edit: output-rendering valves
+        RENDER_THINKING: str = Field(
+            default="details",
+            description=(
+                "How to render model thinking: 'details' (collapsible HTML, "
+                "OpenWebUI UI), 'plain' (blockquote text), or 'off' (drop it). "
+                "Use 'off' or 'plain' for OpenAI-API consumers like Nextcloud "
+                "Assistant that don't render <details>."
+            ),
+        )
+        SHOW_COST: bool = Field(
+            default=True,
+            description=(
+                "Append the '_Cost: $... . ...ms_' footer after each reply. "
+                "Turn off for OpenAI-API consumers where it's just noise."
+            ),
+        )
+        # <<< local edit
 
     def __init__(self) -> None:
         self.valves = self.Valves()
 
     def pipes(self) -> List[Dict[str, str]]:
-        return [{"id": "claude-code", "name": "Claude Code"}]
+        models = [{"id": "claude-code", "name": "Claude Code"}]
+        for svc in _parse_routing_services(self.valves.ROUTING_SERVICES):
+            models.append({"id": f"claude-code-{svc}", "name": f"Claude Code ({svc})"})
+        return models
+
+    # >>> local edit: thinking renderer
+    def _render_thinking(self, text: str) -> str:
+        """Render a completed thinking block according to the RENDER_THINKING
+        valve. 'details' = collapsible HTML (OpenWebUI UI), 'plain' = blockquote
+        (for API consumers with no <details> support, e.g. Nextcloud Assistant),
+        'off' = drop it. Returns "" when there's nothing to emit."""
+        text = text.strip()
+        if not text or self.valves.RENDER_THINKING == "off":
+            return ""
+        if self.valves.RENDER_THINKING == "plain":
+            quoted = "\n".join(f"> {ln}" for ln in text.splitlines())
+            return f"\n\n> 💭 **Thinking**\n{quoted}\n\n"
+        return (
+            "\n\n<details>\n<summary>💭 Thinking</summary>\n\n"
+            f"{text}\n\n</details>\n\n"
+        )
+
+    # <<< local edit
 
     async def _run_fast(
         self,
@@ -1580,14 +1761,11 @@ class Pipe:
                         elif etype == "content_block_stop":
                             idx = ev.get("index", 0)
                             if idx in thinking_buffers:
-                                text = thinking_buffers.pop(idx).strip()
-                                if text:
-                                    yield (
-                                        "\n\n<details>\n"
-                                        "<summary>💭 Thinking</summary>\n\n"
-                                        f"{text}\n\n"
-                                        "</details>\n\n"
-                                    )
+                                # >>> local edit: route through _render_thinking
+                                block = self._render_thinking(thinking_buffers.pop(idx))
+                                if block:
+                                    yield block
+                                # <<< local edit
                     elif isinstance(message, AssistantMessage):
                         # Tool-use rendering (KB tools only here).
                         for block in message.content:
@@ -1669,7 +1847,21 @@ class Pipe:
                 "not work correctly for this call (see OpenWebUI issue about "
                 "metadata.chat_id being unset for certain internal calls)."
             )
-        workdir = Path(self.valves.WORKDIR_ROOT) / chat_id
+        route_key = resolve_route(
+            _parse_routing_services(self.valves.ROUTING_SERVICES),
+            body,
+            __metadata__,
+            __user__,
+        )
+        if route_key:
+            # Routed: shared cwd per route (=> isolated memory per route); the
+            # resume key stays per-chat within the route so chats don't mix.
+            workdir = Path(self.valves.WORKDIR_ROOT) / route_key
+            session_key = f"{route_key}:{chat_id}"
+            log.info("Routing to session %s (chat_id=%s)", route_key, chat_id)
+        else:
+            workdir = Path(self.valves.WORKDIR_ROOT) / chat_id
+            session_key = chat_id
         workdir.mkdir(parents=True, exist_ok=True)
 
         allowed_tools = [
@@ -1688,10 +1880,10 @@ class Pipe:
         #      (e.g. WORKDIR_ROOT lives on ephemeral storage that was wiped
         #      independently of OpenWebUI's own chat database).
         session_store = get_store(self.valves.WORKDIR_ROOT)
-        resume_id = _chat_sessions.get(chat_id)
+        resume_id = _chat_sessions.get(session_key)
         resume_source = "memory" if resume_id else None
         if not resume_id:
-            resume_id = session_store.get(chat_id)
+            resume_id = session_store.get(session_key)
             if resume_id:
                 resume_source = "sqlite"
         if not resume_id:
@@ -1823,12 +2015,12 @@ class Pipe:
                         if message.subtype == "init":
                             session_id = message.data.get("session_id")
                             if session_id:
-                                _chat_sessions[chat_id] = session_id
+                                _chat_sessions[session_key] = session_id
                                 # Persist beyond this process's lifetime/worker.
                                 # Cheap (single upsert) and done on every init
                                 # message, i.e. once per turn — not hot-path
                                 # sensitive.
-                                session_store.set(chat_id, session_id)
+                                session_store.set(session_key, session_id)
                         continue
 
                     if isinstance(message, StreamEvent):
@@ -1855,13 +2047,11 @@ class Pipe:
                         elif etype == "content_block_stop":
                             idx = ev.get("index", 0)
                             if idx in thinking_buffers:
-                                text = thinking_buffers.pop(idx).strip()
-                                if text:
-                                    yield (
-                                        "\n\n<details>\n<summary>💭 Thinking</summary>\n\n"
-                                        f"{text}\n\n"
-                                        "</details>\n\n"
-                                    )
+                                # >>> local edit: route through _render_thinking
+                                block = self._render_thinking(thinking_buffers.pop(idx))
+                                if block:
+                                    yield block
+                                # <<< local edit
                         continue
 
                     if isinstance(message, AssistantMessage):
@@ -1945,8 +2135,10 @@ class Pipe:
                             yield f"\n\n_Agent stopped: {message.subtype}_\n"
                         if message.api_error_status:
                             yield f"\n\n**API-Fehler:** `{message.api_error_status}`\n"
-                        if message.total_cost_usd is not None:
+                        # >>> local edit: gate cost footer behind SHOW_COST
+                        if message.total_cost_usd is not None and self.valves.SHOW_COST:
                             yield f"\n\n_Cost: ${message.total_cost_usd:.4f} · {message.duration_ms}ms_\n"
+                        # <<< local edit
                         # Fallback-path marker (see session_marker.py): embed
                         # the session_id invisibly in the reply itself so it
                         # can be recovered from OpenWebUI's own chat history
@@ -1954,7 +2146,7 @@ class Pipe:
                         # store are unavailable on a later turn. This does
                         # NOT write into any OpenWebUI-owned data — it's part
                         # of the ordinary streamed assistant text.
-                        current_session_id = _chat_sessions.get(chat_id)
+                        current_session_id = _chat_sessions.get(session_key)
                         if current_session_id:
                             yield make_marker(current_session_id)
                         return
@@ -1971,3 +2163,4 @@ class Pipe:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
+

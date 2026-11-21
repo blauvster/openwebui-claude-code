@@ -42,6 +42,26 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 | `WORKDIR_ROOT`            | `/tmp/claude-agent-pipe`                             | Root directory for per-chat workspaces.                                             |
 | `MAX_TURNS`                | `30`                                                 | Max agent turns per user message. `0` disables the cap.                             |
 
+## Multi-session routing (per-service / per-user memory)
+
+Set the `ROUTING_SERVICES` valve to give each service (and optionally each user) its own Claude Code workdir, session and memory. Example: `home-assistant,nextcloud:user`.
+
+- `home-assistant` → one shared session, workdir `WORKDIR_ROOT/home-assistant`
+- `nextcloud:user` → one session per user, workdir `WORKDIR_ROOT/nextcloud-<user-slug>`
+
+**Memory isolation.** Claude Code stores auto-memory under `~/.claude/projects/<cwd with / and . replaced by ->/memory/`. Because every route has a unique cwd, memory is isolated automatically. With `WORKDIR_ROOT=/root/claude-sessions`, the Home Assistant memory lives at `/root/.claude/projects/-root-claude-sessions-home-assistant/memory/`. Set `SETTING_SOURCES` to include `user` if memory/CLAUDE.md loading requires it in your setup.
+
+**How callers identify themselves** (first match wins):
+
+1. An explicit `route` object in the request body (or metadata): `{"route": {"service": "nextcloud", "user": "alice@example.com"}}`
+2. The model id: each configured service is also exposed as a model, e.g. `claude-code-home-assistant`, `claude-code-nextcloud`. For per-user services the user comes from the authenticated OpenWebUI user (email, then id).
+
+Calls that match no configured service fall back to the normal per-chat workspace. The `route.user` field is caller-supplied, so only trust it from callers holding a trusted API key (e.g. the Nextcloud integration); prefer one OpenWebUI account per user where possible.
+
+**Sessions are created dynamically** on first use, but only for services listed in `ROUTING_SERVICES` (the allowlist). Within a route, each OpenWebUI `chat_id` resumes its own conversation; chats share the route's memory.
+
+**Adding a service or user:** append the service to `ROUTING_SERVICES` (`...,paperless:user`) and save the valve. Users need no setup; their session appears on their first request.
+
 ## Auth notes
 
 When both auth methods are present, the OAuth token wins and the API key is unset before invoking the SDK so it can't override.
