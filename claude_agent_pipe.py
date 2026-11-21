@@ -1287,6 +1287,25 @@ def _parse_routing_services(raw: str) -> Dict[str, bool]:
     return services
 
 
+def _route_lookup(raw: str, route_key: Optional[str]) -> Any:
+    """JSON-mapping lookup: exact route key, else longest service-name prefix."""
+    if not raw or not route_key:
+        return None
+    try:
+        mapping = json.loads(raw)
+    except ValueError:
+        log.warning("Route valve is not valid JSON; ignoring")
+        return None
+    if not isinstance(mapping, dict):
+        return None
+    if route_key in mapping:
+        return mapping[route_key]
+    for name in sorted(mapping, key=len, reverse=True):
+        if route_key.startswith(name + "-"):
+            return mapping[name]
+    return None
+
+
 def _route_context(raw: str, route_key: Optional[str]) -> str:
     """Context text for a route: exact route key first, then its service name
     (the route key minus a trailing '-<user>' part, matched by longest prefix)."""
@@ -1404,6 +1423,18 @@ class Pipe:
                 '{"home-assistant": "You assist with Home Assistant...", '
                 '"nextcloud": "You assist a Nextcloud user..."}. Built-in '
                 "'memory' that does not depend on SETTING_SOURCES."
+            ),
+        )
+        ROUTE_MCP_SERVERS: str = Field(
+            default="",
+            description=(
+                "JSON mapping a service name (or full route key) to extra MCP "
+                "servers for that route, in Claude Agent SDK format. Example "
+                "for Home Assistant's MCP Server integration: "
+                '{"home-assistant": {"ha": {"type": "http", "url": '
+                '"http://<HA_HOST>:8123/api/mcp", "headers": '
+                '{"Authorization": "Bearer <LONG_LIVED_TOKEN>"}}}}. '
+                "Tools appear as mcp__<name>__<tool> and are auto-allowed."
             ),
         )
         MAX_TURNS: int = Field(
@@ -1969,6 +2000,13 @@ class Pipe:
             mcp_servers["helm-kb"] = kb_server
         if owui_server is not None:
             mcp_servers["owui-tools"] = owui_server
+        extra_mcp = _route_lookup(self.valves.ROUTE_MCP_SERVERS, route_key)
+        if isinstance(extra_mcp, dict):
+            for name, cfg in extra_mcp.items():
+                mcp_servers[name] = cfg
+                options_kwargs["allowed_tools"] = options_kwargs["allowed_tools"] + [
+                    f"mcp__{name}"
+                ]
         if mcp_servers:
             options_kwargs["mcp_servers"] = mcp_servers
 
