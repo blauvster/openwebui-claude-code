@@ -1287,6 +1287,26 @@ def _parse_routing_services(raw: str) -> Dict[str, bool]:
     return services
 
 
+def _route_context(raw: str, route_key: Optional[str]) -> str:
+    """Context text for a route: exact route key first, then its service name
+    (the route key minus a trailing '-<user>' part, matched by longest prefix)."""
+    if not raw or not route_key:
+        return ""
+    try:
+        mapping = json.loads(raw)
+    except ValueError:
+        log.warning("ROUTE_CONTEXT is not valid JSON; ignoring")
+        return ""
+    if not isinstance(mapping, dict):
+        return ""
+    if route_key in mapping:
+        return str(mapping[route_key])
+    for name in sorted(mapping, key=len, reverse=True):
+        if route_key.startswith(name + "-"):
+            return str(mapping[name])
+    return ""
+
+
 def resolve_route(
     services: Dict[str, bool],
     body: Dict[str, Any],
@@ -1373,6 +1393,17 @@ class Pipe:
                 "'home-assistant,nextcloud:user'. Each route gets its own "
                 "workdir (WORKDIR_ROOT/<route>) and therefore its own Claude "
                 "Code memory. Empty = disabled (one workspace per chat)."
+            ),
+        )
+        ROUTE_CONTEXT: str = Field(
+            default="",
+            description=(
+                "JSON object mapping a service name (or full route key, which "
+                "wins) to standing context text appended to the system prompt "
+                "for that route, e.g. "
+                '{"home-assistant": "You assist with Home Assistant...", '
+                '"nextcloud": "You assist a Nextcloud user..."}. Built-in '
+                "'memory' that does not depend on SETTING_SOURCES."
             ),
         )
         MAX_TURNS: int = Field(
@@ -1945,6 +1976,11 @@ class Pipe:
         # the Workspace Model configured. `append` keeps the agentic prompt
         # intact while adding domain persona/rules on top.
         system_prompt = _extract_system_prompt(body)
+        route_context = _route_context(self.valves.ROUTE_CONTEXT, route_key)
+        if route_context:
+            system_prompt = (
+                f"{route_context}\n\n{system_prompt}" if system_prompt else route_context
+            )
         if system_prompt:
             options_kwargs["system_prompt"] = {
                 "type": "preset",
